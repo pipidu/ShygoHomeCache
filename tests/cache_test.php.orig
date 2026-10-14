@@ -1,0 +1,246 @@
+<?php
+
+declare(strict_types=1);
+
+require dirname(__DIR__) . '/ShygoHomeCache/Cache.php';
+
+use TypechoPlugin\ShygoHomeCache\Cache;
+
+function expect(bool $condition, string $message): void
+{
+    if (!$condition) {
+        fwrite(STDERR, "FAIL: {$message}\n");
+        exit(1);
+    }
+}
+
+function expectSame($actual, $expected, string $message): void
+{
+    if ($actual !== $expected) {
+        fwrite(STDERR, "FAIL: {$message}\n  expected: " . var_export($expected, true) . "\n  actual:   " . var_export($actual, true) . "\n");
+        exit(1);
+    }
+}
+
+$html = "<!DOCTYPE html>\n<html><head><title>Home</title></head><body>"
+    . str_repeat('post ', 40)
+    . "\n\nSHYGO1\ncreated:1\n</body></html>\n";
+expect(strlen($html) >= 64, 'fixture is long enough to look like a page');
+expect(Cache::looksLikeHtmlPage($html), 'html fixture is recognized');
+expect(!Cache::looksLikeHtmlPage('<html></html>'), 'short documents are rejected');
+expect(!Cache::looksLikeHtmlPage(str_repeat('x', 80)), 'non-html is rejected');
+
+$homeCases = [
+    ['/', '/', true],
+    ['', '/', true],
+    ['/index.php', '/', true],
+    ['/index.php/', '/', true],
+    ['/Index.php', '/', true],
+    ['/page/1', '/', true],
+    ['/page/1/', '/', true],
+    ['/page/2', '/', false],
+    ['/page/10', '/', false],
+    ['/page/11', '/', false],
+    ['/feed/', '/', false],
+    ['/admin/', '/', false],
+    ['/index.php/feed', '/', false],
+    ['/index.php/page/1/', '/', true],
+    ['/index.php/page/2/', '/', false],
+    ['/blog/', '/blog', true],
+    ['/blog', '/blog', true],
+    ['/blog/page/1/', '/blog', true],
+    ['/blog/index.php', '/blog', true],
+    ['/blog/index.php/page/1', '/blog', true],
+    ['/blog/index.php/page/2', '/blog', false],
+    ['/blog/post/hello', '/blog', false],
+    ['/blog2', '/blog', false],
+    ['/blogging', '/blog', false],
+    ['/other', '/blog', false],
+];
+
+foreach ($homeCases as [$request, $base, $expected]) {
+    expectSame(
+        Cache::isHomePath($request, $base),
+        $expected,
+        "isHomePath({$request}, {$base})"
+    );
+}
+
+expectSame(
+    Cache::requestPathFrom('/index.php?utm_source=ads', '/page/2'),
+    '/index.php/page/2',
+    'PATH_INFO is appended when the URI does not already contain it'
+);
+expect(
+    !Cache::isHomePath(Cache::requestPathFrom('/index.php', '/page/2'), '/'),
+    'page 2 via PATH_INFO is not the front page'
+);
+expect(
+    Cache::isHomePath(Cache::requestPathFrom('/index.php/page/1/', '/page/1'), '/'),
+    'PATH_INFO is not appended twice'
+);
+expectSame(Cache::normalizePath('/page/1/'), '/page/1', 'trailing slash is removed');
+expectSame(Cache::normalizePath('page//1'), '/page/1', 'slashes are collapsed');
+
+expect(!Cache::hasMeaningfulQuery([]), 'empty query is cacheable');
+expect(!Cache::hasMeaningfulQuery(['utm_source' => 'x', 'fbclid' => 'y', 'gclid' => 'z']), 'tracking params are ignored');
+expect(Cache::hasMeaningfulQuery(['s' => 'hello']), 'search is meaningful');
+expect(Cache::hasMeaningfulQuery(['purge' => 'nope']), 'a purge query is meaningful until the token matches');
+expect(Cache::hasMeaningfulQuery(['utm_source' => 'x', 'preview' => '1']), 'unknown params still bypass');
+
+$dir = sys_get_temp_dir() . '/shygo-home-cache-' . bin2hex(random_bytes(4));
+$disk = Cache::openDisk($dir);
+expect($disk->ensureDir(), 'cache directory can be created');
+expect(is_file($dir . '/.htaccess'), 'htaccess is written for a new cache directory');
+expect(is_file($dir . '/index.php'), 'index guard is written');
+
+$created = 1_700_000_000;
+expect($disk->write($html, 700, $created), 'disk write succeeds');
+$hit = $disk->read(120, 600, $created + 10);
+expectSame($hit['state'], 'hit', 'fresh disk snapshot is a hit');
+expectSame($hit['html'], $html, 'disk body round-trips, including embedded header text');
+expectSame($hit['age'], 10, 'age is now minus created');
+
+$stale = $disk->read(120, 600, $created + 120);
+expectSame($stale['state'], 'stale', 'age equal to TTL is stale while grace remains');
+expect(is_string($stale['html']), 'stale read still returns html');
+
+$expired = $disk->read(120, 600, $created + 720);
+expectSame($expired['state'], 'miss', 'past TTL plus grace is a miss');
+expectSame($expired['html'], null, 'expired html is not served');
+
+$noGrace = $disk->read(120, 0, $created + 120);
+expectSame($noGrace['state'], 'miss', 'grace 0 does not serve stale html');
+
+file_put_contents($dir . '/homepage.cache', "SHYGO1\ncreated:1\nbytes:4\n\nTOO-LONG");
+$corrupt = $disk->read(120, 600, 10);
+expectSame($corrupt['state'], 'miss', 'a length mismatch is a miss');
+
+expect($disk->write($html, 700, $created), 'rewrite after corruption succeeds');
+$disk->purge();
+expectSame($disk->read(120, 600, $created)['state'], 'miss', 'purge removes the disk snapshot');
+expect(glob($dir . '/homepage.cache*') === [], 'purge removes temp cache files');
+
+$lockDir = sys_get_temp_dir() . '/shygo-home-lock-' . bin2hex(random_bytes(4));
+$holder = Cache::openDisk($lockDir);
+expect($holder->acquireLock(5), 'parent acquires the disk lock');
+$child = proc_open(
+    [PHP_BINARY, dirname(__FILE__) . '/lock_child.php', $lockDir],
+    [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+    $pipes
+);
+expect(is_resource($child), 'lock child process starts');
+$childOut = stream_get_contents($pipes[1]);
+$childErr = stream_get_contents($pipes[2]);
+fclose($pipes[1]);
+fclose($pipes[2]);
+$childCode = proc_close($child);
+expectSame($childCode, 0, 'lock child exits 0: ' . $childErr);
+expectSame($childOut, "busy\n", 'a second process does not take a held disk lock');
+$holder->releaseLock();
+
+$child = proc_open(
+    [PHP_BINARY, dirname(__FILE__) . '/lock_child.php', $lockDir],
+    [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+    $pipes
+);
+expect(is_resource($child), 'second lock child starts');
+$childOut = stream_get_contents($pipes[1]);
+fclose($pipes[1]);
+fclose($pipes[2]);
+proc_close($child);
+expectSame($childOut, "locked\n", 'the disk lock can be taken after release');
+
+if (Cache::apcuAvailable()) {
+    $key = 'shygo_test_' . bin2hex(random_bytes(4));
+    $apcu = Cache::openApcu($key);
+    expect($apcu->write($html, 700, $created), 'apcu write succeeds');
+    $apcuHit = $apcu->read(120, 600, $created + 5);
+    expectSame($apcuHit['state'], 'hit', 'apcu hit');
+    expectSame($apcuHit['html'], $html, 'apcu body matches');
+    expectSame($apcu->read(120, 600, $created + 200)['state'], 'stale', 'apcu stale window');
+    expect($apcu->acquireLock(5), 'apcu lock acquired');
+    $other = Cache::openApcu($key);
+    expect(!$other->acquireLock(5), 'apcu lock is exclusive');
+    $apcu->releaseLock();
+    expect($other->acquireLock(5), 'apcu lock is free after release');
+    $other->releaseLock();
+    $apcu->purge();
+    expectSame($apcu->read(120, 600, $created)['state'], 'miss', 'apcu purge drops the entry');
+    echo "APCu tests passed\n";
+} else {
+    echo "APCu not enabled; skipped APCu tests\n";
+}
+
+$secret = 'DogeCloudCDNTestDogeCloudCDNTest';
+$vector = Cache::dogeAuthKey('/test/a.jpg', 1582638821, 'HRtzwh43en96cih4ZBk67ePCU4esNPGx', 0, $secret);
+expectSame(
+    $vector,
+    '1582638821-HRtzwh43en96cih4ZBk67ePCU4esNPGx-0-4a98a6d76ca0acc83469b68612551aa3',
+    'DogeCloud Type-A example vector'
+);
+$negative = Cache::dogeAuthKey('/test/a.jpg', 1582638821, 'rand', -1, $secret);
+expectSame(
+    $negative,
+    '1582638821-rand--1-' . md5('/test/a.jpg-1582638821-rand--1-' . $secret),
+    'negative uid is embedded the same way DogeUpload prints it'
+);
+
+$page = '<!DOCTYPE html><html><body><img src="https://cdn.example.com/test/a.jpg?foo=1">'
+    . '<img src="https://other.example.com/test/a.jpg">'
+    . str_repeat('x', 40)
+    . '</body></html>';
+$stripped = Cache::rewriteCdnUrls($page, 'https://cdn.example.com', 'webp', '', 1_700_000_000, 300, 0);
+expect(strpos($stripped, 'https://cdn.example.com/test/a.jpg/webp?foo=1') !== false, 'thumb is appended and other query params stay when auth is off');
+expect(strpos($stripped, 'https://cdn.example.com/test/a.jpg/webp/webp') === false, 'thumb is not applied twice');
+expect(strpos($stripped, 'https://other.example.com/test/a.jpg') !== false, 'a different host is left alone');
+$again = Cache::rewriteCdnUrls($stripped, 'https://cdn.example.com/', 'webp', '', 1_700_000_000, 300, 0);
+expectSame($again, $stripped, 'a second thumb pass is stable');
+
+$signed = Cache::rewriteCdnUrls($stripped, 'https://cdn.example.com', 'webp', $secret, 1_700_000_000, 300, 0, 'fixedrand');
+$expectedKey = Cache::dogeAuthKey('/test/a.jpg/webp', 1_700_000_300, 'fixedrand', 0, $secret);
+expect(strpos($signed, 'https://cdn.example.com/test/a.jpg/webp?auth_key=' . $expectedKey) !== false, 'serve path signs the thumb path');
+expect(strpos($signed, 'foo=1') === false, 'DogeUpload replaces the CDN query with auth_key');
+expect(!Cache::containsDogeAuthKey($stripped), 'stored HTML has no Doge auth_key');
+expect(Cache::containsDogeAuthKey($signed), 'served HTML has a Doge auth_key');
+$resigned = Cache::rewriteCdnUrls($signed, 'https://cdn.example.com', 'webp', $secret, 1_700_001_000, 300, -5, 'otherrand');
+$resignedKey = Cache::dogeAuthKey('/test/a.jpg/webp', 1_700_001_300, 'otherrand', -5, $secret);
+expect(strpos($resigned, 'auth_key=' . $resignedKey) !== false, 'an old auth_key is replaced for the next visitor');
+expect(substr_count($resigned, '/webp/webp') === 0, 're-signing does not stack the thumb rule');
+expect(strpos($resigned, 'https://other.example.com/test/a.jpg') !== false, 're-signing leaves the other host unchanged');
+
+$before = ob_get_level();
+ob_start();
+echo 'BEFORE';
+ob_start(static function (string $chunk): string {
+    return 'SIGNED(' . $chunk . ')';
+});
+echo 'INNER';
+$captured = Cache::captureNestedBuffers($before);
+expectSame($captured, 'BEFORESIGNED(INNER)', 'nested output handlers run before the snapshot is stored');
+
+$plugin = file_get_contents(dirname(__DIR__) . '/ShygoHomeCache/Plugin.php');
+expect(is_string($plugin), 'Plugin.php is readable');
+foreach ([
+    "factory('index.php')->begin_1",
+    "factory('index.php')->end_100",
+    "factory('Widget\\\\Archive')->beforeRender",
+    'finishPublish',
+    'finishDelete',
+    'finishMark',
+    'finishComment',
+    '__typecho_uid',
+    'shygo_purge',
+    'DogeUpload',
+    'rewriteCdnUrls',
+] as $needle) {
+    expect(is_string($plugin) && strpos($plugin, $needle) !== false, "Plugin.php contains {$needle}");
+}
+expect(
+    is_string($plugin) && strpos($plugin, "where('name = ?', 'plugins')") === false,
+    'the plugin does not replace the plugins option'
+);
+    expect(is_string($plugin) && strpos($plugin, $needle) !== false, "Plugin.php contains {$needle}");
+}
+
+echo "OK\n";

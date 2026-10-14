@@ -1,0 +1,6 @@
+# Ignore local cache blobs
+cache/*
+!cache/.htaccess
+!cache/.gitignore
+!cache/web.config
+!cache/index.php
